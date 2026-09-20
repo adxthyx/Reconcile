@@ -36,6 +36,9 @@ interface TxnDao {
     @Query("SELECT * FROM transactions WHERE id = :id")
     suspend fun byId(id: Long): Txn?
 
+    @Query("SELECT * FROM transactions WHERE id = :id")
+    fun observeById(id: Long): Flow<Txn?>
+
     @Query(
         """SELECT * FROM transactions
            WHERE timestamp BETWEEN :from AND :to
@@ -43,7 +46,9 @@ interface TxnDao {
              AND (:categoryId IS NULL OR categoryId = :categoryId)
              AND (:direction IS NULL OR direction = :direction)
              AND (:tag = '' OR tags LIKE '%' || :tag || '%')
-             AND (:query = '' OR merchant LIKE '%' || :query || '%' OR note LIKE '%' || :query || '%')
+             AND (:query = '' OR merchant LIKE '%' || :query || '%'
+                  OR note LIKE '%' || :query || '%'
+                  OR CAST(amountPaise / 100.0 AS TEXT) LIKE '%' || :query || '%')
            ORDER BY timestamp DESC"""
     )
     fun observeFiltered(
@@ -58,6 +63,13 @@ interface TxnDao {
 
     @Query("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT :limit")
     fun observeRecent(limit: Int): Flow<List<Txn>>
+
+    @Query(
+        """SELECT * FROM transactions
+           WHERE direction = 'DEBIT' AND excluded = 0
+           ORDER BY timestamp DESC LIMIT :limit"""
+    )
+    suspend fun recentExpenses(limit: Int): List<Txn>
 
     @Query("SELECT * FROM transactions ORDER BY timestamp")
     fun observeAllTxns(): Flow<List<Txn>>
@@ -91,6 +103,21 @@ interface TxnDao {
            FROM transactions WHERE excluded = 0 AND timestamp BETWEEN :from AND :to"""
     )
     fun observeExpense(from: Long, to: Long): Flow<Long>
+
+    @Query(
+        """SELECT COALESCE(SUM(CASE WHEN direction = 'DEBIT'
+                    THEN amountPaise - COALESCE(splitOwedPaise, 0) ELSE 0 END), 0)
+           FROM transactions WHERE excluded = 0 AND timestamp BETWEEN :from AND :to"""
+    )
+    suspend fun expenseTotal(from: Long, to: Long): Long
+
+    @Query(
+        """SELECT categoryId, SUM(amountPaise - COALESCE(splitOwedPaise, 0)) AS totalPaise
+           FROM transactions
+           WHERE direction = 'DEBIT' AND excluded = 0 AND timestamp BETWEEN :from AND :to
+           GROUP BY categoryId ORDER BY totalPaise DESC"""
+    )
+    suspend fun spendByCategory(from: Long, to: Long): List<CategorySum>
 
     @Query(
         """SELECT COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amountPaise ELSE 0 END), 0)
@@ -269,6 +296,13 @@ interface BudgetDao {
 
     @Query("SELECT * FROM budgets WHERE categoryId IS NULL LIMIT 1")
     suspend fun overall(): Budget?
+
+    @Query(
+        """SELECT * FROM budgets
+           WHERE (:categoryId IS NULL AND categoryId IS NULL) OR categoryId = :categoryId
+           LIMIT 1"""
+    )
+    suspend fun forCategory(categoryId: Long?): Budget?
 }
 
 @Dao
@@ -296,6 +330,9 @@ interface MerchantMappingDao {
 
     @Query("SELECT * FROM merchant_mappings")
     suspend fun all(): List<MerchantMapping>
+
+    @Query("SELECT * FROM merchant_mappings ORDER BY updatedAt DESC")
+    fun observeAll(): Flow<List<MerchantMapping>>
 }
 
 @Dao

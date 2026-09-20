@@ -17,6 +17,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -45,6 +46,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.abc.expensetracker.data.CardBill
+import com.abc.expensetracker.data.Budget
 import com.abc.expensetracker.data.Txn
 import com.abc.expensetracker.ui.common.BudgetBar
 import com.abc.expensetracker.ui.common.CategoryDot
@@ -63,47 +65,49 @@ fun BudgetsScreen(vm: BudgetsVm) {
     val recurring by vm.recurring.collectAsStateWithLifecycle()
     val cards by vm.cards.collectAsStateWithLifecycle()
     var showAddBudget by remember { mutableStateOf(false) }
+    var budgetToEdit by remember { mutableStateOf<Budget?>(null) }
     var cardToEdit by remember { mutableStateOf<CardBill?>(null) }
     var showAddCard by remember { mutableStateOf(false) }
     var cycleFor by remember { mutableStateOf<CardRow?>(null) }
+    val overallBudget = rows.firstOrNull { it.budget.categoryId == null }
+    val categoryBudgets = rows.filter { it.budget.categoryId != null }
 
     LazyColumn(Modifier.fillMaxSize()) {
-
-        // ------------------------------------------------------------ cards
+        // Keep the overall limit first and give it an explicit action. It is
+        // the number used by the home-screen widget, so it must not be hidden
+        // behind an unlabeled add icon or below the card-reminder list.
         item {
-            SectionHeader("Credit card bills") {
-                IconButton(onClick = { showAddCard = true }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add card")
-                }
-            }
+            SectionHeader("Monthly budget")
         }
-        items(cards, key = { "c${it.card.id}" }) { row ->
-            CardBillRow(
-                row = row,
-                onMarkPaid = { vm.markPaid(row) },
-                onMarkUnpaid = { vm.markUnpaid(row) },
-                onEdit = { cardToEdit = row.card },
-                onCycle = { cycleFor = row },
+        item {
+            OverallBudgetCard(
+                row = overallBudget,
+                onSetOrUpdate = {
+                    if (overallBudget == null) showAddBudget = true
+                    else budgetToEdit = overallBudget.budget
+                },
             )
         }
 
         // ---------------------------------------------------------- budgets
         item {
-            SectionHeader("Monthly budgets") {
-                IconButton(onClick = { showAddBudget = true }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add budget")
+            SectionHeader("Category budgets") {
+                TextButton(onClick = { showAddBudget = true }) {
+                    Icon(Icons.Default.Add, contentDescription = null)
+                    Spacer(Modifier.width(4.dp))
+                    Text("Add")
                 }
             }
         }
-        if (rows.isEmpty()) {
+        if (categoryBudgets.isEmpty()) {
             item {
                 EmptyState(
-                    "🎯", "No budgets yet",
-                    "Set a monthly cap per category (or one overall). Envelope mode rolls unspent money into next month.",
+                    "🎯", "No category budgets",
+                    "Optional: add a separate monthly cap for food, shopping, travel, or any other category.",
                 )
             }
         }
-        items(rows, key = { "b${it.budget.id}" }) { row ->
+        items(categoryBudgets, key = { "b${it.budget.id}" }) { row ->
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -139,6 +143,12 @@ fun BudgetsScreen(vm: BudgetsVm) {
                         )
                     }
                 }
+                IconButton(onClick = { budgetToEdit = row.budget }) {
+                    Icon(
+                        Icons.Default.Edit, contentDescription = "Edit budget",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 IconButton(onClick = { vm.removeBudget(row.budget) }) {
                     Icon(
                         Icons.Default.Delete, contentDescription = "Remove budget",
@@ -146,6 +156,26 @@ fun BudgetsScreen(vm: BudgetsVm) {
                     )
                 }
             }
+        }
+
+        // ------------------------------------------------------------ cards
+        item {
+            SectionHeader("Credit card bills") {
+                TextButton(onClick = { showAddCard = true }) {
+                    Icon(Icons.Default.Add, contentDescription = null)
+                    Spacer(Modifier.width(4.dp))
+                    Text("Add card")
+                }
+            }
+        }
+        items(cards, key = { "c${it.card.id}" }) { row ->
+            CardBillRow(
+                row = row,
+                onMarkPaid = { vm.markPaid(row) },
+                onMarkUnpaid = { vm.markUnpaid(row) },
+                onEdit = { cardToEdit = row.card },
+                onCycle = { cycleFor = row },
+            )
         }
 
         // -------------------------------------------------------- recurring
@@ -184,8 +214,12 @@ fun BudgetsScreen(vm: BudgetsVm) {
         item { Spacer(Modifier.height(96.dp)) }
     }
 
-    if (showAddBudget) {
-        BudgetSheet(vm = vm, onDismiss = { showAddBudget = false })
+    if (showAddBudget || budgetToEdit != null) {
+        BudgetSheet(
+            vm = vm,
+            existing = budgetToEdit,
+            onDismiss = { showAddBudget = false; budgetToEdit = null },
+        )
     }
     if (showAddCard || cardToEdit != null) {
         CardSheet(
@@ -196,6 +230,70 @@ fun BudgetsScreen(vm: BudgetsVm) {
     }
     cycleFor?.let { row ->
         CycleSheet(vm = vm, row = row, onDismiss = { cycleFor = null })
+    }
+}
+
+@Composable
+private fun OverallBudgetCard(
+    row: com.abc.expensetracker.ui.vm.BudgetRow?,
+    onSetOrUpdate: () -> Unit,
+) {
+    Card(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
+        ),
+    ) {
+        Column(Modifier.padding(18.dp)) {
+            if (row == null) {
+                Text(
+                    "Set your overall monthly limit",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "This powers budget utilization in the app and home-screen widget.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(14.dp))
+                Button(onClick = onSetOrUpdate, modifier = Modifier.fillMaxWidth()) {
+                    Text("Set monthly budget")
+                }
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Overall spending limit",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            Money.format(row.budget.limitPaise),
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Button(onClick = onSetOrUpdate) {
+                        Icon(Icons.Default.Edit, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Update")
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                BudgetBar(spent = row.spentPaise, limit = row.effectiveLimitPaise)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "${Money.format(row.spentPaise)} used this month",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -275,14 +373,20 @@ private fun CardBillRow(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BudgetSheet(vm: BudgetsVm, onDismiss: () -> Unit) {
+private fun BudgetSheet(vm: BudgetsVm, existing: Budget?, onDismiss: () -> Unit) {
     val categories by vm.categories.collectAsStateWithLifecycle()
-    var amount by remember { mutableStateOf("") }
-    var selectedCat by remember { mutableStateOf<Long?>(null) }
-    var rollover by remember { mutableStateOf(false) }
+    var amount by remember(existing) {
+        mutableStateOf(existing?.limitPaise?.let { Money.format(it, withSymbol = false) } ?: "")
+    }
+    var selectedCat by remember(existing) { mutableStateOf(existing?.categoryId) }
+    var rollover by remember(existing) { mutableStateOf(existing?.rollover ?: false) }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.padding(horizontal = 20.dp)) {
-            Text("New budget", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(
+                if (existing == null) "New budget" else "Update budget",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
             Spacer(Modifier.height(12.dp))
             OutlinedTextField(
                 value = amount,
@@ -299,6 +403,7 @@ private fun BudgetSheet(vm: BudgetsVm, onDismiss: () -> Unit) {
                         selected = selectedCat == null,
                         onClick = { selectedCat = null },
                         label = { Text("🌐 Overall") },
+                        enabled = existing == null,
                     )
                 }
                 items(categories.filter { !it.isIncome && !it.excludeFromTotals }) { c ->
@@ -306,6 +411,7 @@ private fun BudgetSheet(vm: BudgetsVm, onDismiss: () -> Unit) {
                         selected = selectedCat == c.id,
                         onClick = { selectedCat = c.id },
                         label = { Text("${c.emoji} ${c.name}") },
+                        enabled = existing == null,
                     )
                 }
             }
@@ -327,7 +433,7 @@ private fun BudgetSheet(vm: BudgetsVm, onDismiss: () -> Unit) {
                 Button(
                     onClick = {
                         Money.parse(amount)?.let {
-                            vm.setBudget(selectedCat, it, rollover)
+                            vm.setBudget(existing, selectedCat, it, rollover)
                             onDismiss()
                         }
                     },
@@ -386,7 +492,7 @@ private fun CardSheet(vm: BudgetsVm, existing: CardBill?, onDismiss: () -> Unit)
                 )
             }
             Text(
-                "Reminders fire daily at 10am from 3 days before the due day until you mark the bill paid (or a payment SMS arrives).",
+                "Reminders fire daily at 10am from 3 days before the due day. Paid status resets automatically on the 15th of every month.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

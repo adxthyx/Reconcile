@@ -9,6 +9,7 @@ object Money {
     private val indianFormat = DecimalFormat("##,##,##0.##", DecimalFormatSymbols(Locale("en", "IN")))
     private val indianFormatNoDecimals = DecimalFormat("##,##,##0", DecimalFormatSymbols(Locale("en", "IN")))
 
+    @Synchronized
     fun format(paise: Long, withSymbol: Boolean = true): String {
         val rupees = paise / 100.0
         val s = if (paise % 100 == 0L) {

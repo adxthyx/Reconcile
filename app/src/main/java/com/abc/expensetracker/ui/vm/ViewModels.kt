@@ -13,6 +13,7 @@ import com.abc.expensetracker.data.CategorySum
 import com.abc.expensetracker.data.DupDismissal
 import com.abc.expensetracker.data.Goal
 import com.abc.expensetracker.data.MonthSum
+import com.abc.expensetracker.data.MerchantMapping
 import com.abc.expensetracker.data.Txn
 import com.abc.expensetracker.data.TxnSource
 import com.abc.expensetracker.bills.BillReminders
@@ -21,13 +22,16 @@ import com.abc.expensetracker.sms.parser.Direction
 import com.abc.expensetracker.util.Dates
 import com.abc.expensetracker.util.Recurring
 import com.abc.expensetracker.util.RecurringItem
+import com.abc.expensetracker.widget.TodayWidget
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -48,18 +52,9 @@ class VmFactory(private val c: AppContainer) : ViewModelProvider.Factory {
 }
 
 private fun <T> Flow<T>.state(vm: ViewModel, initial: T): StateFlow<T> =
-    stateIn(vm.viewModelScope, SharingStarted.WhileSubscribed(5000), initial)
+    stateIn(vm.viewModelScope, SharingStarted.WhileSubscribed(1000), initial)
 
 // ------------------------------------------------------------------- HOME
-
-data class Anomaly(val txn: Txn, val typicalPaise: Long)
-
-data class Forecast(
-    val projectedSpendPaise: Long,
-    val avgDailyPaise: Long,
-    val daysLeft: Int,
-    val upcomingRecurringPaise: Long,
-)
 
 class HomeVm(private val c: AppContainer) : ViewModel() {
     private val month = Dates.currentMonth()
@@ -70,6 +65,8 @@ class HomeVm(private val c: AppContainer) : ViewModel() {
     val income = c.db.txnDao().observeIncome(range.first, range.last).state(this, 0L)
     val recent = c.db.txnDao().observeRecent(8).state(this, emptyList())
     val categories = c.db.categoryDao().observeAll().state(this, emptyList())
+    val accounts = c.db.accountDao().observeAll().state(this, emptyList())
+    val dailySpend = c.db.txnDao().observeDailySpend(range.first, range.last).state(this, emptyList())
     val spendByCategory = c.db.txnDao().observeSpendByCategory(range.first, range.last)
         .state(this, emptyList())
     val budgets = c.db.budgetDao().observeAll().state(this, emptyList())
@@ -79,51 +76,6 @@ class HomeVm(private val c: AppContainer) : ViewModel() {
     /** null = DataStore not loaded yet — callers must wait for a real value. */
     val importDone: StateFlow<Boolean?> =
         c.settings.historicalImportDone.map { it as Boolean? }.state(this, null)
-
-    /** Cash-flow forecast: current spend + rolling 30-day average for remaining days. */
-    val forecast: StateFlow<Forecast?> = run {
-        val now = System.currentTimeMillis()
-        val last30 = c.db.txnDao().observeExpense(now - 30L * 86_400_000, now)
-        combine(
-            c.db.txnDao().observeExpense(range.first, range.last),
-            last30,
-            c.db.txnDao().observeRecurringCandidates(),
-        ) { monthSpent, spent30, recurringTxns ->
-            val today = LocalDate.now()
-            val daysLeft = today.lengthOfMonth() - today.dayOfMonth
-            val avgDaily = spent30 / 30
-            val monthEnd = Dates.monthRange(month).last
-            val upcoming = Recurring.detect(recurringTxns)
-                .filter { it.nextDueEstimate in now..monthEnd }
-                .sumOf { it.typicalAmountPaise }
-            Forecast(
-                projectedSpendPaise = monthSpent + avgDaily * daysLeft,
-                avgDailyPaise = avgDaily,
-                daysLeft = daysLeft,
-                upcomingRecurringPaise = upcoming,
-            )
-        }
-    }.state(this, null)
-
-    /** Transactions way above the merchant's historical median (≥3 priors, ≥2.5×, ≥₹500 over). */
-    val anomalies: StateFlow<List<Anomaly>> =
-        c.db.txnDao().observeAnomalyCandidates(range.first, range.last).map { txns ->
-            val byMerchant = txns.groupBy { it.merchantNorm }
-            val result = mutableListOf<Anomaly>()
-            for ((_, group) in byMerchant) {
-                val sorted = group.sortedBy { it.timestamp }
-                for (t in sorted) {
-                    if (t.timestamp < range.first) continue
-                    val priors = sorted.filter { it.timestamp < t.timestamp }.map { it.amountPaise }
-                    if (priors.size < 3) continue
-                    val median = priors.sorted()[priors.size / 2]
-                    if (t.amountPaise >= median * 2.5 && t.amountPaise - median >= 50_000) {
-                        result += Anomaly(t, median)
-                    }
-                }
-            }
-            result.sortedByDescending { it.txn.timestamp }.take(5)
-        }.state(this, emptyList())
 
     fun runHistoricalImport() {
         viewModelScope.launch {
@@ -141,7 +93,7 @@ data class TxnFilter(
     val accountId: Long? = null,
     val direction: Direction? = null,
     val tag: String = "",
-    val month: YearMonth? = null, // null = all time
+    val month: YearMonth? = Dates.currentMonth(), // null = all time
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -161,7 +113,7 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
             tag = f.tag,
             query = f.query.trim(),
         )
-    }.state(this, emptyList())
+    }.flowOn(Dispatchers.Default).state(this, emptyList())
 
     /** distinct tags across all txns for the filter row */
     val allTags: StateFlow<List<String>> = c.db.txnDao().observeAllTxns().map { list ->
@@ -182,6 +134,12 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
     fun setMonth(m: YearMonth?) = filter.update { copy(month = m) }
     fun setTag(t: String) = filter.update { copy(tag = t) }
 
+    fun showUncategorized(categoryId: Long) {
+        filter.value = TxnFilter(categoryId = categoryId, month = null)
+    }
+
+    fun observeTransaction(id: Long): Flow<Txn?> = c.db.txnDao().observeById(id)
+
     private inline fun MutableStateFlow<TxnFilter>.update(block: TxnFilter.() -> TxnFilter) {
         value = value.block()
     }
@@ -189,6 +147,64 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
     /** Category correction — feeds the learning layer (merchant or sender). */
     fun recategorize(txn: Txn, categoryId: Long) {
         viewModelScope.launch { c.repo.setCategoryLearning(txn, categoryId) }
+    }
+
+    /** Change only this row; unlike [recategorize], this does not create a merchant rule. */
+    fun recategorizeOnly(txn: Txn, categoryId: Long) {
+        viewModelScope.launch {
+            val category = c.db.categoryDao().all().firstOrNull { it.id == categoryId }
+            c.db.txnDao().update(
+                txn.copy(
+                    categoryId = categoryId,
+                    excluded = category?.excludeFromTotals ?: false,
+                )
+            )
+        }
+    }
+
+    /** Explicit, warned action from the detail editor: update history and future matches. */
+    fun applyMerchantRule(txn: Txn, categoryId: Long, excluded: Boolean) {
+        viewModelScope.launch {
+            c.repo.setCategoryLearning(txn, categoryId)
+            c.repo.setExcludedLearning(txn.copy(categoryId = categoryId), excluded, always = true)
+        }
+    }
+
+    /**
+     * Saves the fields edited together in Transaction Detail as one Room row update.
+     * When [learnRule] is true, category/exclusion are first propagated through the
+     * existing repository learning path; tags and split data remain transaction-only.
+     */
+    fun updateTransactionDetails(
+        txn: Txn,
+        categoryId: Long,
+        excluded: Boolean,
+        tags: String,
+        splitOwedPaise: Long?,
+        splitWith: String,
+        learnRule: Boolean,
+    ) {
+        viewModelScope.launch {
+            if (learnRule) {
+                c.repo.setCategoryLearning(txn, categoryId)
+                c.repo.setExcludedLearning(
+                    txn.copy(categoryId = categoryId),
+                    excluded = excluded,
+                    always = true,
+                )
+            }
+            val current = c.db.txnDao().byId(txn.id) ?: return@launch
+            c.db.txnDao().update(
+                current.copy(
+                    categoryId = categoryId,
+                    excluded = excluded,
+                    tags = tags.ifBlank { null },
+                    splitOwedPaise = splitOwedPaise?.takeIf { it > 0 },
+                    splitWith = splitWith.ifBlank { null },
+                    splitSettled = if (splitOwedPaise != current.splitOwedPaise) false else current.splitSettled,
+                )
+            )
+        }
     }
 
     /** Exclude from all totals (self transfers etc.); always=true teaches it. */
@@ -227,6 +243,7 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
         note: String?,
     ) {
         viewModelScope.launch {
+            val category = c.db.categoryDao().all().firstOrNull { it.id == categoryId }
             c.db.txnDao().insert(
                 Txn(
                     amountPaise = amountPaise,
@@ -238,6 +255,10 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
                     timestamp = System.currentTimeMillis(),
                     note = note?.ifBlank { null },
                     source = TxnSource.MANUAL,
+                    // Built-in non-spend categories (Friends, transfers and
+                    // card payments) must behave the same for manual entries
+                    // as they do for imported or recategorized transactions.
+                    excluded = category?.excludeFromTotals ?: false,
                 )
             )
         }
@@ -247,6 +268,13 @@ class TxnListVm(private val c: AppContainer) : ViewModel() {
 // ------------------------------------------------------------------ STATS
 
 data class CategorySpend(val category: Category, val totalPaise: Long)
+data class CategoryShift(
+    val category: Category,
+    val currentPaise: Long,
+    val previousPaise: Long,
+) {
+    val deltaPaise: Long get() = currentPaise - previousPaise
+}
 
 class StatsVm(private val c: AppContainer) : ViewModel() {
     val month = MutableStateFlow(Dates.currentMonth())
@@ -263,6 +291,48 @@ class StatsVm(private val c: AppContainer) : ViewModel() {
                 .filter { !it.category.isIncome }
         }
     }.state(this, emptyList())
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val currentSpend: StateFlow<Long> = month.flatMapLatest { m ->
+        val r = Dates.monthRange(m)
+        c.db.txnDao().observeExpense(r.first, r.last)
+    }.state(this, 0L)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val previousSpend: StateFlow<Long> = month.flatMapLatest { m ->
+        val r = Dates.monthRange(m.minusMonths(1))
+        c.db.txnDao().observeExpense(r.first, r.last)
+    }.state(this, 0L)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val categoryShifts: StateFlow<List<CategoryShift>> = month.flatMapLatest { m ->
+        val currentRange = Dates.monthRange(m)
+        val previousRange = Dates.monthRange(m.minusMonths(1))
+        combine(
+            c.db.txnDao().observeSpendByCategory(currentRange.first, currentRange.last),
+            c.db.txnDao().observeSpendByCategory(previousRange.first, previousRange.last),
+            c.db.categoryDao().observeAll(),
+        ) { current, previous, categories ->
+            val currentById = current.associate { it.categoryId to it.totalPaise }
+            val previousById = previous.associate { it.categoryId to it.totalPaise }
+            categories.asSequence()
+                .filter { !it.isIncome && !it.excludeFromTotals }
+                .map { category ->
+                    CategoryShift(
+                        category = category,
+                        currentPaise = currentById[category.id] ?: 0L,
+                        previousPaise = previousById[category.id] ?: 0L,
+                    )
+                }
+                .filter { it.deltaPaise != 0L }
+                .sortedByDescending { abs(it.deltaPaise) }
+                .toList()
+        }
+    }.state(this, emptyList())
+
+    val overallBudget: StateFlow<Budget?> = c.db.budgetDao().observeAll()
+        .map { budgets -> budgets.firstOrNull { it.categoryId == null } }
+        .state(this, null)
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val dailySpend = month.flatMapLatest { m ->
@@ -351,11 +421,12 @@ class BudgetsVm(private val c: AppContainer) : ViewModel() {
                 effectiveLimitPaise = effective,
             )
         }.sortedBy { it.category?.sortOrder ?: -1 }
-    }.state(this, emptyList())
+    }.flowOn(Dispatchers.Default).state(this, emptyList())
 
     val recurring: StateFlow<List<RecurringItem>> =
         c.db.txnDao().observeRecurringCandidates()
             .map { Recurring.detect(it) }
+            .flowOn(Dispatchers.Default)
             .state(this, emptyList())
 
     // ------------------------------------------------------------ cards
@@ -384,12 +455,12 @@ class BudgetsVm(private val c: AppContainer) : ViewModel() {
                 card = card,
                 dueDate = due,
                 daysLeft = due.toEpochDay() - today.toEpochDay(),
-                paidThisCycle = card.lastPaidCycle == YearMonth.from(due).toString(),
+                paidThisCycle = card.lastPaidCycle == BillReminders.paidStateCycleKey(today),
                 runningCycleSpendPaise = cycleSpend,
                 accountId = account?.id,
             )
         }.sortedBy { it.dueDate }
-    }.state(this, emptyList())
+    }.flowOn(Dispatchers.Default).state(this, emptyList())
 
     private fun lastStatementDate(statementDay: Int, today: LocalDate): LocalDate {
         val ym = YearMonth.from(today)
@@ -403,7 +474,7 @@ class BudgetsVm(private val c: AppContainer) : ViewModel() {
     fun markPaid(row: CardRow) {
         viewModelScope.launch {
             c.db.cardBillDao().update(
-                row.card.copy(lastPaidCycle = YearMonth.from(row.dueDate).toString())
+                row.card.copy(lastPaidCycle = BillReminders.paidStateCycleKey(LocalDate.now()))
             )
         }
     }
@@ -412,15 +483,34 @@ class BudgetsVm(private val c: AppContainer) : ViewModel() {
         viewModelScope.launch { c.db.cardBillDao().update(row.card.copy(lastPaidCycle = null)) }
     }
 
-    fun saveCard(existing: CardBill?, name: String, tail: String?, dueDay: Int, statementDay: Int) {
+    fun saveCard(
+        existing: CardBill?,
+        name: String,
+        tail: String?,
+        dueDay: Int,
+        statementDay: Int,
+        enabled: Boolean = existing?.enabled ?: true,
+    ) {
         viewModelScope.launch {
             if (existing == null) {
                 c.db.cardBillDao().insert(
-                    CardBill(name = name, tail = tail, dueDay = dueDay, statementDay = statementDay)
+                    CardBill(
+                        name = name,
+                        tail = tail,
+                        dueDay = dueDay,
+                        statementDay = statementDay,
+                        enabled = enabled,
+                    )
                 )
             } else {
                 c.db.cardBillDao().update(
-                    existing.copy(name = name, tail = tail, dueDay = dueDay, statementDay = statementDay)
+                    existing.copy(
+                        name = name,
+                        tail = tail,
+                        dueDay = dueDay,
+                        statementDay = statementDay,
+                        enabled = enabled,
+                    )
                 )
             }
         }
@@ -439,16 +529,21 @@ class BudgetsVm(private val c: AppContainer) : ViewModel() {
         return c.db.txnDao().cycleTxns(acc, from, System.currentTimeMillis())
     }
 
-    fun setBudget(categoryId: Long?, limitPaise: Long, rollover: Boolean) {
+    fun setBudget(existing: Budget?, categoryId: Long?, limitPaise: Long, rollover: Boolean) {
         viewModelScope.launch {
-            c.db.budgetDao().upsert(
-                Budget(
+            val current = existing ?: c.db.budgetDao().forCategory(categoryId)
+            if (current == null) {
+                c.db.budgetDao().upsert(Budget(
                     categoryId = categoryId,
                     limitPaise = limitPaise,
                     rollover = rollover,
                     createdAt = System.currentTimeMillis(),
+                ))
+            } else {
+                c.db.budgetDao().update(
+                    current.copy(limitPaise = limitPaise, rollover = rollover)
                 )
-            )
+            }
         }
     }
 
@@ -468,6 +563,17 @@ class MoreVm(private val c: AppContainer) : ViewModel() {
     val txnCount = c.db.txnDao().observeCount().state(this, 0)
     val importState: StateFlow<ImportState> = c.importer.state
     val categories = c.db.categoryDao().observeAll().state(this, emptyList())
+    val merchantMappings: StateFlow<List<MerchantMapping>> =
+        c.db.merchantMappingDao().observeAll().state(this, emptyList())
+    val uncategorized: StateFlow<List<Txn>> = combine(
+        c.db.txnDao().observeAllTxns(),
+        c.db.categoryDao().observeAll(),
+    ) { txns, categories ->
+        val otherId = categories.firstOrNull { it.key == "other" }?.id
+        if (otherId == null) emptyList()
+        else txns.filter { it.categoryId == otherId && !it.excluded }
+            .sortedByDescending { it.timestamp }
+    }.state(this, emptyList())
 
     private val dismissalsChanged = MutableStateFlow(0)
 
@@ -501,7 +607,7 @@ class MoreVm(private val c: AppContainer) : ViewModel() {
             }
         }
         pairs.sortedByDescending { it.b.timestamp }.take(20)
-    }.state(this, emptyList())
+    }.flowOn(Dispatchers.Default).state(this, emptyList())
 
     val openSplits: StateFlow<List<Txn>> = c.db.txnDao().observeOpenSplits().state(this, emptyList())
 
@@ -523,7 +629,10 @@ class MoreVm(private val c: AppContainer) : ViewModel() {
     }
 
     fun setTheme(mode: ThemeMode) {
-        viewModelScope.launch { c.settings.setThemeMode(mode) }
+        viewModelScope.launch {
+            c.settings.setThemeMode(mode)
+            TodayWidget.refresh(c.appContext)
+        }
     }
 
     fun addGoal(name: String, emoji: String, targetPaise: Long) {

@@ -1,5 +1,6 @@
 package com.abc.expensetracker.data
 
+import com.abc.expensetracker.bills.BillReminders
 import com.abc.expensetracker.sms.parser.Categorizer
 import com.abc.expensetracker.sms.parser.CcBillPayment
 import com.abc.expensetracker.sms.parser.Direction
@@ -7,7 +8,6 @@ import com.abc.expensetracker.sms.parser.Instrument
 import com.abc.expensetracker.sms.parser.ParsedTransaction
 import com.abc.expensetracker.util.Dates
 import java.security.MessageDigest
-import java.time.YearMonth
 
 sealed class InsertResult {
     data class Inserted(val id: Long) : InsertResult()
@@ -122,7 +122,7 @@ class TxnRepository(private val db: KharchaDb) {
                     .takeIf { it.size == 1 }?.first()
             }
             ?: return
-        val cycle = currentCycleKey(card, epochMillis)
+        val cycle = currentCycleKey(epochMillis)
         if (card.lastPaidCycle != cycle) {
             cardBillDao.update(card.copy(lastPaidCycle = cycle))
         }
@@ -132,13 +132,10 @@ class TxnRepository(private val db: KharchaDb) {
         }
     }
 
-    /** "yyyy-MM" of the due date that epochMillis falls in the window of. */
-    fun currentCycleKey(card: CardBill, epochMillis: Long): String {
+    /** Reminder period containing this payment; all cards reset on the 15th. */
+    fun currentCycleKey(epochMillis: Long): String {
         val date = Dates.toLocalDate(epochMillis)
-        val ym = YearMonth.from(date)
-        val due = ym.atDay(card.dueDay.coerceAtMost(ym.lengthOfMonth()))
-        // Payments after this month's due date belong to next month's bill.
-        return if (date.isAfter(due)) ym.plusMonths(1).toString() else ym.toString()
+        return BillReminders.paidStateCycleKey(date)
     }
 
     /**

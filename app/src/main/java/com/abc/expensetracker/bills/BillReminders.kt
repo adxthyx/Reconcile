@@ -34,6 +34,7 @@ object BillReminders {
     private const val REQUEST_CODE = 4110
 
     const val REMIND_DAYS_BEFORE = 3L
+    const val PAID_STATE_RESET_DAY = 15
     const val ACTION_CHECK = "com.abc.expensetracker.BILL_CHECK"
 
     /** Due date of the cycle epochDate falls in (due day clamped to month length). */
@@ -46,8 +47,22 @@ object BillReminders {
         } else thisMonthDue
     }
 
-    fun cycleKey(card: CardBill, today: LocalDate): String =
-        YearMonth.from(dueDateFor(card, today)).toString()
+    /**
+     * Key for the period in which a card was marked paid. Every card starts a
+     * fresh reminder period on the 15th, independent of its individual due day.
+     *
+     * Before the 15th we are still in the period that began on the previous
+     * month's 15th; on and after the 15th we use the current month. Keeping the
+     * value in the existing yyyy-MM column makes this change migration-free.
+     */
+    fun paidStateCycleKey(today: LocalDate): String {
+        val periodMonth = if (today.dayOfMonth >= PAID_STATE_RESET_DAY) {
+            YearMonth.from(today)
+        } else {
+            YearMonth.from(today).minusMonths(1)
+        }
+        return periodMonth.toString()
+    }
 
     /** Cards needing a reminder today: within window and not marked paid. */
     fun dueCards(cards: List<CardBill>, today: LocalDate): List<Pair<CardBill, LocalDate>> =
@@ -55,7 +70,7 @@ object BillReminders {
             val due = dueDateFor(card, today)
             val windowStart = due.minusDays(REMIND_DAYS_BEFORE)
             val inWindow = !today.isBefore(windowStart) && !today.isAfter(due)
-            val unpaid = card.lastPaidCycle != YearMonth.from(due).toString()
+            val unpaid = card.lastPaidCycle != paidStateCycleKey(today)
             if (inWindow && unpaid) card to due else null
         }
 

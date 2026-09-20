@@ -36,6 +36,10 @@ object Seed {
             key = "selftransfer", name = "Self Transfer", emoji = "🔄", color = 0xFF5E718D,
             sortOrder = 18, excludeFromTotals = true,
         ),
+        Category(
+            key = "friends", name = "Friends", emoji = "🤝", color = 0xFF4C6EF5,
+            sortOrder = 19, excludeFromTotals = true,
+        ),
     )
 
     val defaultAccount = Account(name = "Cash", type = AccountType.CASH)
